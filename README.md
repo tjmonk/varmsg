@@ -48,13 +48,15 @@ An example configuration is shown below:
     "output_type" : "mqueue",
     "output" : "/splunk",
     "prefix" : "/varmsg/msg1/",
-    "header" : "/usr/share/headers/header1",
+    "header" : [ "/sys/test/a", "/sys/test/b" ],
     "interval" : 60,
     "trigger" : {
         "tags" : "test",
         "flags" : "volatile"
     },
-    "vars" : {
+    "body" : {
         "tags" : "test"
-    }
+    },
+    "headername" : "header",
+    "bodyname" : "body"
 }
