@@ -153,7 +153,7 @@ typedef struct _varMsgConfig
     char *prefix;
 
     /*! time interval in seconds */
-    uint32_t interval;
+    int interval;
 
     /*! countdown timer starts at "interval" and counts down to zero */
     uint32_t t;
@@ -207,6 +207,9 @@ typedef struct _varMsgState
     /*! number of variables output for the current render */
     size_t outputCount;
 
+    /*! output stream for current render */
+    int fd;
+
     /*! pointer to a list of Variable Message Configurations managed
         by this instance */
     VarMsgConfig *pMessageConfigs;
@@ -226,6 +229,9 @@ typedef struct _varMsgState
 /*==============================================================================
         Private file scoped variables
 ==============================================================================*/
+
+/*! Variable Message Manager State */
+static VarMsgState state;
 
 /*! pointer to variable message list */
 static VarMsgConfig *pVarMsgs = NULL;
@@ -250,6 +256,8 @@ VARSERVER_HANDLE hVarServer = NULL;
 int main(int argc, char **argv);
 static int ProcessOptions( int argC, char *argV[], VarMsgState *pState );
 static void usage( char *cmdname );
+static void TerminationHandler( int signum, siginfo_t *info, void *ptr );
+static void SetupTerminationHandler( void );
 static int SetupVarFP( VarMsgState *pState );
 static int ProcessConfigDir( VarMsgState *pState, char *pDirname );
 static int ProcessConfigFile( VarMsgState *pState, char *filename );
@@ -276,7 +284,7 @@ static int ProcessTimer( VarMsgState *pState );
 static int ProcessMessage( VarMsgState *pState, VarMsgConfig *pMsgConfig );
 static int RenderMessage( VarMsgState *pState, VarMsgConfig *pMsg, int fd );
 static int OutputVar( VAR_HANDLE hVar, void *arg );
-static int OutputJSONVar( char prefix, VarInfo *info, char *value );
+static int OutputJSONVar( char prefix, VarInfo *info, char *value, int fd );
 static bool IsJSON( char *value );
 
 /*==============================================================================
@@ -305,7 +313,6 @@ static bool IsJSON( char *value );
 ==============================================================================*/
 int main(int argc, char **argv)
 {
-    VarMsgState state;
     int result = EINVAL;
 
     /* clear the variable message state object */
@@ -313,6 +320,9 @@ int main(int argc, char **argv)
 
     /* process the command line options */
     ProcessOptions( argc, argv, &state );
+
+    /* set up the abnormal termination handler */
+    SetupTerminationHandler();
 
     /* initialize a memory buffer for output */
     result = SetupVarFP( &state );
@@ -599,39 +609,49 @@ static int ProcessConfigFile( VarMsgState *pState, char *filename )
 
         /* parse the JSON config file */
         config = JSON_Process( pFileName );
-
-        /* allocate a VarMsgConfig object */
-        pConfig = calloc( 1, sizeof( VarMsgConfig ) );
-        if ( pConfig != NULL )
+        if ( config != NULL )
         {
-            /* set the configuration name */
-            pConfig->configName = pFileName;
-
-            /* check enabled flag */
-            pConfig->enabled = JSON_GetBool( config, "enabled" );
-
-            /* get variable prefix */
-            pConfig->prefix = JSON_GetStr( config, "prefix" );
-
-            /* get processing interval */
-            JSON_GetNum( config, "interval", &pConfig->interval );
-
-            /* process trigger variables */
-            result = ProcessTriggerConfig( pState, config, pConfig );
-
-            /* process message body variables */
-            result = ProcessVarsConfig( pState, config, pConfig );
-
-            if ( pState->pMessageConfigs == NULL )
+            /* allocate a VarMsgConfig object */
+            pConfig = calloc( 1, sizeof( VarMsgConfig ) );
+            if ( pConfig != NULL )
             {
-                /* add the first configuration */
-                pState->pMessageConfigs = pConfig;
-            }
-            else
-            {
-                /* insert the new configuration at the head of the list */
-                pConfig->pNext = pState->pMessageConfigs;
-                pState->pMessageConfigs = pConfig;
+                /* set the configuration name */
+                pConfig->configName = pFileName;
+
+                /* check enabled flag */
+                pConfig->enabled = JSON_GetBool( config, "enabled" );
+
+                /* get variable prefix */
+                pConfig->prefix = JSON_GetStr( config, "prefix" );
+
+                /* get processing interval */
+                JSON_GetNum( config, "interval", &pConfig->interval );
+                if ( pConfig->interval != 0 )
+                {
+                    /* initialize the countdown timer */
+                    pConfig->t = pConfig->interval;
+                }
+
+                /* process trigger variables */
+                result = ProcessTriggerConfig( pState, config, pConfig );
+
+                /* process message body variables */
+                result = ProcessVarsConfig( pState, config, pConfig );
+
+                /* increment the number of messages we are handling */
+                pState->numMsgs++;
+
+                if ( pState->pMessageConfigs == NULL )
+                {
+                    /* add the first configuration */
+                    pState->pMessageConfigs = pConfig;
+                }
+                else
+                {
+                    /* insert the new configuration at the head of the list */
+                    pConfig->pNext = pState->pMessageConfigs;
+                    pState->pMessageConfigs = pConfig;
+                }
             }
         }
     }
@@ -875,6 +895,8 @@ static int BuildQuery( JObject *config, VarQuery *query )
          ( config->node.type == JSON_OBJECT ) &&
          ( query != NULL ) )
     {
+        result = EOK;
+
         query->type = 0;
 
         /* get a pointer to the JSON node */
@@ -930,10 +952,6 @@ static int BuildQuery( JObject *config, VarQuery *query )
         if ( JSON_GetNum( pNode, "instanceID", &query->instanceID ) == EOK )
         {
             query->type |= QUERY_INSTANCEID;
-        }
-        else
-        {
-            result = ENOTSUP;
         }
 
         if ( ( result == EOK ) &&
@@ -1380,8 +1398,16 @@ static int RenderMessage( VarMsgState *pState, VarMsgConfig *pMsg, int fd )
         /* initialize the variable count for the current render */
         pState->outputCount = 0;
 
+        /* initialize the output file descriptor */
+        pState->fd = fd;
+
+        write( fd, "{", 1 );
+
         /* map the OutputVar function across the variable cache */
         result = VARCACHE_Map( pMsg->pVarCache, OutputVar, (void *)pState );
+
+        write( fd, "}", 1 );
+        write( fd, "\n", 1 );
 
     }
 
@@ -1450,7 +1476,7 @@ static int OutputVar( VAR_HANDLE hVar, void *arg )
                     prefix = ( pState->outputCount > 0 ) ? ',' : ' ';
 
                     /* output the data */
-                    OutputJSONVar( prefix, &info, pData );
+                    OutputJSONVar( prefix, &info, pData, pState->fd );
 
                     /* clear the memory */
                     pData[0] = '\0';
@@ -1492,11 +1518,15 @@ static int OutputVar( VAR_HANDLE hVar, void *arg )
         value
             value of the variable as a string
 
+    @param[in]
+        fd
+            output file descriptor
+
     @retval EOK the JSON value was output
     @retval EINVAL invalid arguments
 
 ==============================================================================*/
-static int OutputJSONVar( char prefix, VarInfo *info, char *value )
+static int OutputJSONVar( char prefix, VarInfo *info, char *value, int fd )
 {
     int result = EINVAL;
 
@@ -1507,14 +1537,16 @@ static int OutputJSONVar( char prefix, VarInfo *info, char *value )
         {
             if ( info->instanceID == 0 )
             {
-                printf( "%c\"%s\":%s",
+                dprintf( fd,
+                        "%c\"%s\":%s",
                         prefix,
                         info->name,
                         value );
             }
             else
             {
-                printf( "%c\"[%d]%s\":%s",
+                dprintf( fd,
+                        "%c\"[%d]%s\":%s",
                         prefix,
                         info->instanceID,
                         info->name,
@@ -1525,14 +1557,16 @@ static int OutputJSONVar( char prefix, VarInfo *info, char *value )
         {
             if ( info->instanceID == 0 )
             {
-                printf( "%c\"%s\":\"%s\"",
+                dprintf( fd,
+                        "%c\"%s\":\"%s\"",
                         prefix,
                         info->name,
                         value );
             }
             else
             {
-                printf( "%c\"[%d]%s\":\"%s\"",
+                dprintf( fd,
+                        "%c\"[%d]%s\":\"%s\"",
                         prefix,
                         info->instanceID,
                         info->name,
@@ -1616,6 +1650,76 @@ static bool IsJSON( char *value )
     }
 
     return result;
+}
+
+/*============================================================================*/
+/*  SetupTerminationHandler                                                   */
+/*!
+    Set up an abnormal termination handler
+
+    The SetupTerminationHandler function registers a termination handler
+    function with the kernel in case of an abnormal termination of this
+    process.
+
+==============================================================================*/
+static void SetupTerminationHandler( void )
+{
+    static struct sigaction sigact;
+
+    memset( &sigact, 0, sizeof(sigact) );
+
+    sigact.sa_sigaction = TerminationHandler;
+    sigact.sa_flags = SA_SIGINFO;
+
+    sigaction( SIGTERM, &sigact, NULL );
+    sigaction( SIGINT, &sigact, NULL );
+
+}
+
+/*============================================================================*/
+/*  TerminationHandler                                                        */
+/*!
+    Abnormal termination handler
+
+    The TerminationHandler function will be invoked in case of an abnormal
+    termination of this process.  The termination handler closes
+    the connection with the variable server and cleans up any open
+    resources.
+
+@param[in]
+    signum
+        The signal which caused the abnormal termination (unused)
+
+@param[in]
+    info
+        pointer to a siginfo_t object (unused)
+
+@param[in]
+    ptr
+        signal context information (ucontext_t) (unused)
+
+==============================================================================*/
+static void TerminationHandler( int signum, siginfo_t *info, void *ptr )
+{
+    /* signum, info, and ptr are unused */
+    (void)signum;
+    (void)info;
+    (void)ptr;
+
+    printf("Abnormal termination of varmsg service\n" );
+
+    if ( state.hVarServer != NULL )
+    {
+        VARSERVER_Close( state.hVarServer );
+    }
+
+    if ( state.pVarFP != NULL )
+    {
+        /* close the output memory buffer */
+        VARFP_Close( state.pVarFP );
+    }
+
+    exit( 1 );
 }
 
 /*! @}

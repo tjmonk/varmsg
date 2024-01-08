@@ -1,15 +1,8 @@
 {
     "enabled" : true,
-    "output_type" : "mqueue",
-    "output" : "/splunk",
-    "prefix" : "/varmsg/msg1/",
-    "header" : "/usr/share/headers/header1",
-    "interval" : 60,
-    "trigger" : {
-        "tags" : "test",
-        "flags" : "volatile"
-    },
+    "prefix" : "/msg1",
+    "interval" : 10,
     "vars" : {
-        "tags" : "test"
+        "match" : "stats/g"
     }
 }
