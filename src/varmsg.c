@@ -176,6 +176,18 @@ typedef struct _varMsgConfig
     /*! cache of variables to put in message body */
     VarCache *pVarCache;
 
+    /*! transmission counter */
+    VAR_HANDLE hTxCount;
+
+    /*! transmission error counter */
+    VAR_HANDLE hErrCount;
+
+    /*! trigger */
+    VAR_HANDLE hTrigger;
+
+    /*! enable control */
+    VAR_HANDLE hEnable;
+
     /*! pointer to the next variable message */
     struct _varMsgConfig *pNext;
 } VarMsgConfig;
@@ -216,6 +228,21 @@ typedef struct _varMsgState
 
 } VarMsgState;
 
+/*! MsgVar object to define a message variable to be created */
+typedef struct _msgVar
+{
+    /* name of the variable */
+    char *name;
+
+    /* variable flags to be set */
+    uint32_t flags;
+
+    /*! notification type for the variable */
+    NotificationType notifyType;
+
+    /*! pointer to a location to store the variable handle once it is created */
+    VAR_HANDLE *pVarHandle;
+} MsgVar;
 
 /*! Initial variable cache size */
 #define CACHE_SIZE_INITIAL          ( 50 )
@@ -279,13 +306,29 @@ static int BuildQuery( JObject *config, VarQuery *query );
 static int ProcessVarList( JArray *pVarList, VarCache **ppVarCache );
 static int AddToCache( JNode *pNode, void *arg );
 static int SetupTimer( int s );
+static int SetupModifiedTrigger( VarMsgState *pState, VarMsgConfig *pConfig );
+static int varmsg_CacheNotify( VAR_HANDLE hVar, void *arg );
+
 static void RunMessageGenerator( VarMsgState *pState );
 static int ProcessTimer( VarMsgState *pState );
+static int ProcessModified( VarMsgState *pState, VAR_HANDLE hVar );
 static int ProcessMessage( VarMsgState *pState, VarMsgConfig *pMsgConfig );
 static int RenderMessage( VarMsgState *pState, VarMsgConfig *pMsg, int fd );
 static int OutputVar( VAR_HANDLE hVar, void *arg );
 static int OutputJSONVar( char prefix, VarInfo *info, char *value, int fd );
 static bool IsJSON( char *value );
+
+static int SetEnableStatus( VarMsgState *pState, VarMsgConfig *pConfig );
+static int SetupMessageVars( VarMsgState *pState, VarMsgConfig *pConfig );
+VAR_HANDLE SetupMessageVar( VarMsgState *pState,
+                            VarMsgConfig *pConfig,
+                            char *name,
+                            uint32_t flags,
+                            NotificationType notify );
+static int MakeVarName( char *prefix,
+                        char *name,
+                        char *out,
+                        size_t outlen );
 
 /*==============================================================================
         Private function definitions
@@ -637,6 +680,16 @@ static int ProcessConfigFile( VarMsgState *pState, char *filename )
 
                 /* process message body variables */
                 result = ProcessVarsConfig( pState, config, pConfig );
+
+                /* set up the variables which will trigger a message
+                   generation when they are modified */
+                result = SetupModifiedTrigger( pState, pConfig );
+
+                /* set up the message variables */
+                result = SetupMessageVars( pState, pConfig );
+
+                /* set the enable status */
+                result = SetEnableStatus( pState, pConfig );
 
                 /* increment the number of messages we are handling */
                 pState->numMsgs++;
@@ -1084,7 +1137,6 @@ static int ProcessVarList( JArray *pVarList, VarCache **ppVarCache )
          ( ppVarCache != NULL ) )
     {
         pVarCache = *ppVarCache;
-
         if ( pVarCache == NULL )
         {
             /* count the number of items in the array */
@@ -1097,6 +1149,7 @@ static int ProcessVarList( JArray *pVarList, VarCache **ppVarCache )
                 {
                     /* iterate through the variable list and build
                        the VarCache */
+                    pVarCache = *ppVarCache;
                     result = JSON_Iterate( pVarList,
                                            AddToCache,
                                            (void *)pVarCache );
@@ -1161,6 +1214,10 @@ static int AddToCache( JNode *pNode, void *arg )
                 result = ENOENT;
             }
         }
+        else
+        {
+            printf("Expected string type for variable name\n");
+        }
     }
 
     return result;
@@ -1217,6 +1274,85 @@ static int SetupTimer( int s )
 }
 
 /*============================================================================*/
+/*  SetupModifiedTrigger                                                                */
+/*!
+    Set up "modified" triggers for the message
+
+    The SetupModifiedTrigger function requests a NOTIFY_MODIFIED notification
+    for each appropriate variable in the message.  This includes
+    any "trigger" variable, and any message group with the trigger
+    flag set.
+
+    @param[in]
+        pState
+            Pointer to the Variable Message state
+
+    @param[in]
+        pConfig
+            Pointer to the configuration for the Variable Message
+
+    @retval EOK notifications were set up ok
+    @retval EINVAL invalid arguments
+    @retval other error from VAR_Notify
+
+==============================================================================*/
+static int SetupModifiedTrigger( VarMsgState *pState, VarMsgConfig *pConfig )
+{
+    int result = EINVAL;
+
+    if ( ( pState != NULL ) &&
+         ( pConfig != NULL ) )
+    {
+        result = EOK;
+
+        if ( pConfig->pTriggerCache != NULL )
+        {
+            result = VARCACHE_Map( pConfig->pTriggerCache,
+                                   varmsg_CacheNotify,
+                                   pState->hVarServer );
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  varmsg_CacheNotify                                                        */
+/*!
+    Mapping callback function to request a variable notification
+
+    The varmsg_CacheNotify callback function is used by the
+    VARQUERY_Map function to request a NOTIFY_MODIFIED notification for a cache
+    variable.
+
+    @param[in]
+        hVar
+            handle of variable to be added to the cache
+
+    @param[in]
+        arg
+            opaque pointer argument from the map function
+            which is converted to the variable server handle.
+
+    @retval EOK - notify request was successful
+    @retval EINVAL - invalid arguments
+
+==============================================================================*/
+static int varmsg_CacheNotify( VAR_HANDLE hVar, void *arg )
+{
+    int result = EINVAL;
+    VARSERVER_HANDLE hVarServer = (VARSERVER_HANDLE)arg;
+
+    if ( ( hVarServer != NULL ) &&
+         ( hVar != VAR_INVALID ) )
+    {
+        result = VAR_Notify( hVarServer, hVar, NOTIFY_MODIFIED );
+    }
+
+    return result;
+}
+
+/*============================================================================*/
 /*  RunMessageGenerator                                                       */
 /*!
     Run the message generator main loop
@@ -1237,6 +1373,7 @@ static void RunMessageGenerator( VarMsgState *pState )
     int sig;
     int sigval;
     int result;
+    VAR_HANDLE hVar;
 
     while( 1 )
     {
@@ -1246,6 +1383,11 @@ static void RunMessageGenerator( VarMsgState *pState )
         {
             /* process received timer signal */
             result = ProcessTimer( pState );
+        }
+        else if ( sig == SIG_VAR_MODIFIED )
+        {
+            hVar = (VAR_HANDLE)sigval;
+            result = ProcessModified( pState, hVar );
         }
     }
 }
@@ -1316,6 +1458,80 @@ static int ProcessTimer( VarMsgState *pState )
 }
 
 /*============================================================================*/
+/*  ProcessModified                                                           */
+/*!
+    Process a NOTIFY_MODIFIED notification
+
+    The ProcessModified function iterates through all of the Variable
+    Message Configurations, and checks if the variable modified notication
+    should trigger a message transmission.
+
+    @param[in]
+        pState
+            pointer to the Variable Message Generator state object
+            containing the Variable Message Configurations to process.
+
+    @param[in]
+        hVar
+            handle to the modified variable
+
+    @retval EOK Timer handler processed successfully
+    @retval EINVAL invalid argument
+
+==============================================================================*/
+static int ProcessModified( VarMsgState *pState, VAR_HANDLE hVar )
+{
+    VarMsgConfig *pConfig;
+    VarObject obj;
+    int result;
+    bool forceProcess = false;
+
+    pConfig = pState->pMessageConfigs;
+    while ( pConfig != NULL )
+    {
+        forceProcess = false;
+
+        if ( hVar == pConfig->hTrigger )
+        {
+            forceProcess = true;
+        }
+
+        if ( hVar == pConfig->hEnable )
+        {
+            /* get the value of the enable variable */
+            result = VAR_Get( pState->hVarServer, hVar, &obj );
+            if ( result == EOK )
+            {
+                pConfig->enabled = ( obj.val.ul == 0 ) ? false : true;
+                if ( pConfig->enabled == true )
+                {
+                    /* force processing when message is turned on */
+                    forceProcess = true;
+
+                    if ( pConfig->interval != 0 )
+                    {
+                        /* initialize the countdown timer */
+                        pConfig->t = pConfig->interval;
+                    }
+
+                }
+            }
+        }
+
+        /* see if we are forcing a message generation via the message
+           trigger or by enabling the message, or if the modified variable
+           is in the trigger variable cache */
+        if ( ( forceProcess == true ) ||
+             ( VARCACHE_HasVar( pConfig->pTriggerCache, hVar ) == true ) )
+        {
+            ProcessMessage( pState, pConfig );
+        }
+
+        pConfig = pConfig->pNext;
+    }
+}
+
+/*============================================================================*/
 /*  ProcessMessage                                                            */
 /*!
     Process a Variable Message
@@ -1340,6 +1556,7 @@ static int ProcessTimer( VarMsgState *pState )
 static int ProcessMessage( VarMsgState *pState, VarMsgConfig *pMsgConfig )
 {
     int result = EINVAL;
+    VarObject obj;
 
     if ( ( pState != NULL ) &&
          ( pMsgConfig != NULL ) )
@@ -1352,8 +1569,21 @@ static int ProcessMessage( VarMsgState *pState, VarMsgConfig *pMsgConfig )
                 printf("Processing Message: %s\n", pMsgConfig->configName );
             }
 
+            /* set up the message object */
+            obj.type = VARTYPE_UINT32;
+
             /* render message to standard output */
             result = RenderMessage( pState, pMsgConfig, STDOUT_FILENO );
+            if ( result == EOK )
+            {
+                obj.val.ul = ++pMsgConfig->txCount;
+                VAR_Set( pState->hVarServer, pMsgConfig->hTxCount, &obj );
+            }
+            else
+            {
+                obj.val.ul = ++pMsgConfig->errCount;
+                VAR_Set( pState->hVarServer, pMsgConfig->hErrCount, &obj );
+            }
         }
 
         result = EOK;
@@ -1686,17 +1916,17 @@ static void SetupTerminationHandler( void )
     the connection with the variable server and cleans up any open
     resources.
 
-@param[in]
-    signum
-        The signal which caused the abnormal termination (unused)
+    @param[in]
+        signum
+            The signal which caused the abnormal termination (unused)
 
-@param[in]
-    info
-        pointer to a siginfo_t object (unused)
+    @param[in]
+        info
+            pointer to a siginfo_t object (unused)
 
-@param[in]
-    ptr
-        signal context information (ucontext_t) (unused)
+    @param[in]
+        ptr
+            signal context information (ucontext_t) (unused)
 
 ==============================================================================*/
 static void TerminationHandler( int signum, siginfo_t *info, void *ptr )
@@ -1720,6 +1950,291 @@ static void TerminationHandler( int signum, siginfo_t *info, void *ptr )
     }
 
     exit( 1 );
+}
+
+/*============================================================================*/
+/*  SetupMessageVars                                                          */
+/*!
+    Set up the message variables
+
+    The SetupMessageVars function creates and configures the following
+    variables for the specied message:
+
+    <prefix>trigger - variable to manually trigger message generation
+    <prefix>txcount - count the number of times the message has been generated
+    <prefix>errcount - count the number of errors during message generation
+    <prefix>enable - enable (non-zero) or disable (zero) message generation
+
+    @param[in]
+        pState
+            pointer to the Variable Message State object
+
+    @param[in]
+        pConfig
+            Pointer to the variable configuration to create variables for
+
+    @retval
+        EOK - message variable successfully created
+        EINVAL - invalid arguments
+
+==============================================================================*/
+static int SetupMessageVars( VarMsgState *pState, VarMsgConfig *pConfig )
+{
+    int result = EINVAL;
+    int errcount = 0;
+    int i;
+    int n;
+    VAR_HANDLE *pVarHandle;
+
+    MsgVar vars[] =
+    {
+        { "trigger",
+           VARFLAG_TRIGGER | VARFLAG_VOLATILE,
+           NOTIFY_MODIFIED,
+           &(pConfig->hTrigger) },
+
+        { "txcount",
+          VARFLAG_VOLATILE,
+          NOTIFY_NONE,
+          &(pConfig->hTxCount ) },
+
+        { "errcount",
+          VARFLAG_VOLATILE,
+          NOTIFY_NONE,
+          &(pConfig->hErrCount ) },
+
+        { "enable",
+          VARFLAG_NONE,
+          NOTIFY_MODIFIED,
+          &(pConfig->hEnable ) }
+    };
+
+    n = sizeof( vars ) / sizeof( vars[0] );
+
+    if ( ( pState != NULL ) &&
+         ( pConfig != NULL ) )
+    {
+        for ( i=0 ; i < n ; i++ )
+        {
+            /* get a pointer to the location to store the variable handle */
+            pVarHandle = vars[i].pVarHandle;
+            if ( pVarHandle != NULL )
+            {
+                /* create a message variable */
+                *pVarHandle = SetupMessageVar( pState,
+                                               pConfig,
+                                               vars[i].name,
+                                               vars[i].flags,
+                                               vars[i].notifyType );
+                if ( *pVarHandle == VAR_INVALID )
+                {
+                    printf("Error creating variable: %s\n", vars[i].name );
+                    errcount++;
+                }
+            }
+        }
+    }
+
+    if ( errcount == 0 )
+    {
+        result = EOK;
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  SetEnableStatus                                                           */
+/*!
+    Set the message enable status variable
+
+    The SetEnableStatus function sets the message enable status variable
+    value.
+
+    @param[in]
+        pState
+            pointer to the Variable Message State object
+
+    @param[in]
+        pConfig
+            Pointer to the variable configuration containing the enable
+            status variable to set.
+
+    @retval
+        EOK - enable status successfully updated
+        EINVAL - invalid arguments
+
+==============================================================================*/
+static int SetEnableStatus( VarMsgState *pState, VarMsgConfig *pConfig )
+{
+    int result = EINVAL;
+    VarObject obj;
+
+    if ( ( pState != NULL ) &&
+         ( pConfig != NULL ) )
+    {
+        obj.type = VARTYPE_UINT32;
+        obj.val.ul = pConfig->enabled == true ? 1 : 0;
+        result = VAR_Set( pState->hVarServer, pConfig->hEnable, &obj );
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  SetupMessageVar                                                           */
+/*!
+    Set up a message variable
+
+    The SetupMessageVar function creates a variable name constructed from
+    the message variable name prefix, and the specified variable name.
+    The variable may or may not have a notification associated with it.
+
+@param[in]
+    pState
+        pointer to the Variable Message State object
+
+@param[in]
+    pConfig
+        Pointer to the variable configuration to create a variable for
+
+@param[in]
+    name
+        specify the variable name to create
+
+@param[in]
+    flags
+        flags to add to the variable flag set
+
+@param[in]
+    notify
+        specify the notification type.  Use NOTIFY_NONE if no notification is
+        required
+
+==============================================================================*/
+VAR_HANDLE SetupMessageVar( VarMsgState *pState,
+                            VarMsgConfig *pConfig,
+                            char *name,
+                            uint32_t flags,
+                            NotificationType notify )
+{
+    VAR_HANDLE hVar = VAR_INVALID;
+    VarInfo info;
+    int result;
+
+    if ( ( pState != NULL ) &&
+         ( pConfig != NULL ) &&
+         ( name != NULL ) )
+    {
+        memset( &info, 0, sizeof( VarInfo ) );
+
+        info.flags = flags;
+        info.var.type = VARTYPE_UINT32;
+
+        /* make a variable name */
+        result = MakeVarName( pConfig->prefix,
+                              name,
+                              info.name,
+                              sizeof( info.name ) );
+        if ( result == EOK )
+        {
+            /* create the variable */
+            result = VARSERVER_CreateVar( pState->hVarServer, &info );
+            if ( result == EOK )
+            {
+                hVar = info.hVar;
+            }
+
+            if ( hVar == VAR_INVALID )
+            {
+                hVar = VAR_FindByName( pState->hVarServer, info.name );
+            }
+
+            if ( ( hVar != VAR_INVALID ) &&
+                 ( notify != NOTIFY_NONE ) )
+            {
+                /* set up variable notification */
+                result = VAR_Notify( pState->hVarServer, hVar, notify );
+                if ( result != EOK )
+                {
+                    printf( "VARMSG: Failed to set up notification for '%s'\n",
+                            info.name );
+                }
+            }
+        }
+    }
+
+    return hVar;
+}
+
+/*============================================================================*/
+/*  MakeVarName                                                               */
+/*!
+    Make a variable name from a prefix and a name
+
+    The MakeVarName function creates a variable name constructed from
+    a variable name prefix, and a variable name.  The length of the
+    prefix and the name must be less than the output buffer size including
+    a NULL terminator.
+
+@param[in]
+    prefix
+        The variable name prefix
+
+@param[in]
+    name
+        The variable name
+
+@param[in,out]
+    out
+        pointer to the output buffer
+
+@param[in]
+    outlen
+        length of the output buffer
+
+==============================================================================*/
+static int MakeVarName( char *prefix,
+                        char *name,
+                        char *out,
+                        size_t outlen )
+{
+    size_t prefixlen;
+    size_t namelen;
+    int result = EINVAL;
+
+    if ( ( name != NULL ) &&
+         ( out != NULL ) &&
+         ( outlen != 0 ) )
+    {
+        if ( prefix != NULL )
+        {
+            prefixlen = strlen( prefix );
+        }
+
+        namelen = strlen(name);
+
+        if ( ( prefixlen + namelen ) < outlen )
+        {
+            /* concatenate the prefix and the name */
+            if ( prefix != NULL )
+            {
+                strcpy( out, prefix );
+            }
+
+            strcpy( &out[prefixlen], name );
+
+            /* indicate success */
+            result = EOK;
+        }
+        else
+        {
+            /* not enough space in the output buffer */
+            result = E2BIG;
+        }
+    }
+
+    return result;
 }
 
 /*! @}

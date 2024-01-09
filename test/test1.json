@@ -1,7 +1,8 @@
 {
     "enabled" : true,
-    "prefix" : "/msg1",
+    "prefix" : "/msg1/",
     "interval" : 10,
+    "trigger" : ["foo"],
     "vars" : {
         "match" : "stats/g"
     }

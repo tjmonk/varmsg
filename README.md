@@ -24,6 +24,7 @@ and exposes status and control variables to change the behavior at
 runtime.  For example if the variable prefix for a variable message
 is /msg1, then the following variables will be available:
 
+/msg1/trigger - trigger a transmission
 /msg1/txcount - counts the number of generations/transmissions
 /msg1/errcount - counts the number of errors during generation/transmission
 /msg1/enable - enables or disables sending the data
